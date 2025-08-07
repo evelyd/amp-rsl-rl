@@ -1,124 +1,63 @@
-from __future__ import annotations
+# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Copyright (c) 2021 ETH Zurich, Nikita Rudin
+
+import numpy as np
+
+import escnn
+from escnn.nn import FieldType, EquivariantModule, GeometricTensor
+from morpho_symm.utils.robot_utils import group_rep_from_gens
 
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from rsl_rl.utils import resolve_nn_activation
 
-import escnn
-from escnn.gspaces import *
-from escnn.nn import FieldType, EquivariantModule, GeometricTensor
-import torch.nn.functional as F
-from typing import List, Tuple, Any
-import numpy as np
-
-from hydra import compose, initialize
-
-from morpho_symm.nn.EMLP import EMLP
-from morpho_symm.utils.robot_utils import group_rep_from_gens
 from amp_rsl_rl.dha_utils import ms_joints_to_isaaclab
 
-class ExportedActorMoESymm(nn.Module):
-            def __init__(self, experts, gate, softmax_fn, ms_obs_dim):
-                super().__init__()
-                self.experts = experts
-                self.gate = gate
-                self.softmax_fn = softmax_fn
-                self.ms_obs_dim = ms_obs_dim
-
-            def forward(self, x_tensor: torch.Tensor) -> torch.Tensor:
-                expert_out_tensors = torch.stack([e(x_tensor) for e in self.experts], dim=-1)
-                gate_logits = self.gate(x_tensor)
-                weights = self.softmax_fn(gate_logits).unsqueeze(1)
-                output = (expert_out_tensors * weights).sum(dim=-1)
-                return output
-
-class ActorMoESymm(nn.Module):
-    """
-    Mixture-of-Experts actor:  ⎡expert_1(x) … expert_K(x)⎤·softmax(gate(x))
-    """
-
-    def __init__(
-        self,
-        in_field_type: FieldType,
-        gating_out_field_type: FieldType,
-        out_field_type: FieldType,
-        obs_dim: int,
-        hidden_dims,
-        num_experts: int = 4,
-        gate_hidden_dims: list[int] | None = None,
-        activation="elu",
-    ):
-        super().__init__()
-        self.ms_obs_dim = in_field_type.size
-        self.num_experts = num_experts
-        self.in_field_type = in_field_type
-        self.out_field_type = out_field_type
-
-        # experts
-        self.experts = nn.ModuleList(
-            [SimpleEMLP(in_field_type, out_field_type, hidden_dims=hidden_dims, activation=activation) for _ in range(num_experts)]
-        )
-
-        # gating network
-        self.gate = SimpleEMLP(in_field_type, gating_out_field_type,
-            hidden_dims=gate_hidden_dims,
-            activation=activation)
-
-        self.softmax = SimpleEMLP.get_activation("softmax", gating_out_field_type)
-
-    def forward(self, x: torch.GeometricTensor) -> torch.GeometricTensor:
-        """
-        Args:
-            x: [batch, obs_dim]
-        Returns:
-            mean action: [batch, act_dim]
-        """
-        expert_out = torch.stack([e(x).tensor for e in self.experts], dim=-1)
-        gate_logits = self.gate(x)  # [batch, K]
-        weights = self.softmax(gate_logits).tensor.unsqueeze(1)  # [batch, 1, K]
-        output = (expert_out * weights).sum(dim=-1)  # [batch, act_dim]
-        return GeometricTensor(output, self.out_field_type)
-
-    def export(self) -> nn.Module:
-        exported_experts = nn.ModuleList([e.export() for e in self.experts])
-        exported_gate = self.gate.export()
-        softmax_fn = nn.Softmax(dim=-1)
-
-        return ExportedActorMoESymm(exported_experts, exported_gate, softmax_fn, self.ms_obs_dim)
-
-
-class ActorCriticMoESymm(nn.Module):
-    """Actor-critic with Mixture-of-Experts policy."""
-
+class ActorCriticSymm(nn.Module):
     is_recurrent = False
+    def __init__(self,  num_actor_obs,
+                        num_critic_obs,
+                        num_actions,
+                        amp_joint_names: list[str],
+                        joint_order_for_morphosymm: list[str],
+                        G: escnn.group.groups.cyclicgroup.CyclicGroup,
+                        is_dae: bool = False,
+                        is_ideal: bool = False,
+                        obs_state_ratio: int = 1,
+                        actor_hidden_dims=[256, 256, 256],
+                        critic_hidden_dims=[256, 256, 256],
+                        activation='elu',
+                        init_noise_std=1.0,
+                        noise_std_type: str = "scalar",
+                        **kwargs):
 
-    def __init__(
-        self,
-        num_actor_obs: int,
-        num_critic_obs: int,
-        num_actions: int,
-        amp_joint_names: list[str],
-        joint_order_for_morphosymm: list[str],
-        G: escnn.group.groups.cyclicgroup.CyclicGroup,
-        is_dae: bool = False,
-        is_ideal: bool = False,
-        obs_state_ratio: int = 1,
-        actor_hidden_dims=[256, 256, 256],
-        critic_hidden_dims=[256, 256, 256],
-        num_experts: int = 4,
-        activation: str = "elu",
-        init_noise_std: float = 1.0,
-        noise_std_type: str = "scalar",
-        **kwargs,
-    ):
-        if kwargs:
-            print(
-                (
-                    "ActorCriticMoESymm.__init__ ignored unexpected arguments: "
-                    + str(list(kwargs.keys()))
-                )
-            )
         super().__init__()
 
         self.amp_joint_names = amp_joint_names
@@ -141,6 +80,7 @@ class ActorCriticMoESymm(nn.Module):
 
         # Define the input and output FieldTypes using the representations of each geometric object.
         # Representation of x := [q, v] ∈ Q_js x TqQ_js      =>    ρ_X_js(g) := ρ_Q_js(g) ⊕ ρ_TqQ_js(g)  | g ∈ G
+        # for push door task
         if self.is_ideal:
             base_transition = [rep_Rd, rep_euler_xyz, rep_Rd, rep_TqQJ, rep_TqQJ, rep_TqQJ, rep_xy, rep_euler_z]
             if is_dae:
@@ -199,6 +139,7 @@ class ActorCriticMoESymm(nn.Module):
             critic_in_field_type = FieldType(gspace, base_transition + latent_transition)
         else:
             critic_in_field_type = FieldType(gspace, base_transition)
+        print(f"critic in field type: {critic_in_field_type}")
 
         self.gspace = gspace
         self.in_field_type = in_field_type
@@ -207,43 +148,49 @@ class ActorCriticMoESymm(nn.Module):
 
         # one dimensional field type for critic
         critic_out_field_type = FieldType(gspace, [G.trivial_representation])
-        gating_out_field_type = FieldType(gspace, [G.trivial_representation] * num_experts)
 
-        # Actor (Mixture-of-Experts)
-        self.actor = ActorMoESymm(
-            in_field_type=in_field_type,
-            gating_out_field_type=gating_out_field_type,
-            out_field_type=out_field_type,
-            obs_dim=num_actor_obs,
-            hidden_dims=actor_hidden_dims,
-            num_experts=num_experts,
-            gate_hidden_dims=actor_hidden_dims[:-1],  # last layer is output
-            activation=activation,
-        )
+        # Construct the equivariant MLP
 
-        # Critic
+        self.actor = SimpleEMLP(in_field_type, out_field_type,
+            hidden_dims = actor_hidden_dims,
+            activation = activation,)
+
         self.critic = SimpleEMLP(critic_in_field_type, critic_out_field_type,
-            hidden_dims=critic_hidden_dims,
-            activation=activation, actor=False)
+            hidden_dims = critic_hidden_dims,
+            activation=activation,
+            actor=False)   # Should set False！
 
+        print(f"Actor MLP: {self.actor}")
+        print(f"Critic MLP: {self.critic}")
+        print("FieldType size:", self.in_field_type.size)
+
+        model_parameters = filter(lambda p: p.requires_grad, self.actor.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        print("Actor #Params: ", params)
+        model_parameters = filter(lambda p: p.requires_grad, self.critic.parameters())
+        params = sum([np.prod(p.size()) for p in model_parameters])
+        print("Critic #Params: ", params)
+
+        # Action noise
         self.noise_std_type = noise_std_type
         if self.noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(
-                torch.log(init_noise_std * torch.ones(num_actions))
-            )
+            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
         else:
-            raise ValueError("noise_std_type must be 'scalar' or 'log'")
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
-        # Action distribution (populated in update_distribution)
         self.distribution = None
-        Normal.set_default_validate_args(False)
+        # disable args validation for speedup
+        Normal.set_default_validate_args = False
 
-        print(f"Actor (MoE) structure:\n{self.actor}")
-        print(f"Critic MLP structure:\n{self.critic}")
+    @staticmethod
+    # not used at the moment
+    def init_weights(sequential, scales):
+        [torch.nn.init.orthogonal_(module.weight, gain=scales[idx]) for idx, module in
+         enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))]
 
-    def reset(self, dones=None):  # noqa: D401
+    def reset(self, dones=None):
         pass
 
     def forward(self):
@@ -267,10 +214,14 @@ class ActorCriticMoESymm(nn.Module):
 
         mean = ms_joints_to_isaaclab(mean_ms, self.joint_order_for_morphosymm, self.amp_joint_names)
 
+        # compute standard deviation
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
-        else:  # "log"
+        elif self.noise_std_type == "log":
             std = torch.exp(self.log_std).expand_as(mean)
+        else:
+            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        # create distribution
         self.distribution = Normal(mean, std)
 
     def act(self, observations, **kwargs):
@@ -281,16 +232,28 @@ class ActorCriticMoESymm(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
-        # deterministic (mean) action
         observations = self.in_field_type(observations)
-        return self.actor(observations).tensor
+        actions_mean = self.actor(observations).tensor
+        return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
         critic_observations = self.critic_in_field_type(critic_observations)
-        return self.critic(critic_observations)
+        value = self.critic(critic_observations)
+        return value
 
-    # unchanged load_state_dict so checkpoints from the old class still load
     def load_state_dict(self, state_dict, strict=True):
+        """Load the parameters of the actor-critic model.
+
+        Args:
+            state_dict (dict): State dictionary of the model.
+            strict (bool): Whether to strictly enforce that the keys in state_dict match the keys returned by this
+                           module's state_dict() function.
+
+        Returns:
+            bool: Whether this training resumes a previous training. This flag is used by the `load()` function of
+                  `OnPolicyRunner` to determine how to load further parameters (relevant for, e.g., distillation).
+        """
+
         super().load_state_dict(state_dict, strict=strict)
         return True
 
@@ -340,8 +303,6 @@ class SimpleEMLP(EquivariantModule):
             return escnn.nn.ELU(hidden_type)
         elif activation.lower() == "lrelu":
             return escnn.nn.LeakyReLU(hidden_type)
-        elif activation.lower() == "softmax":
-            return Softmax(hidden_type)
         else:
             raise NotImplementedError
 
@@ -356,104 +317,3 @@ class SimpleEMLP(EquivariantModule):
         for name, module in self.net.named_children():
             sequential.add_module(name, module.export())
         return sequential
-
-class Softmax(EquivariantModule):
-
-    def __init__(self, in_type: FieldType):
-        r"""
-
-        Module that implements a pointwise Softmax to every channel independently.
-        The input representation is preserved by this operation and, therefore, it equals the output
-        representation.
-
-        Only representations supporting pointwise non-linearities are accepted as input field type.
-
-        Args:
-            in_type (FieldType):  the input field type
-            alpha (float): the :math:`\alpha` value for the ELU formulation. Default: 1.0
-            inplace (bool, optional): can optionally do the operation in-place. Default: ``False``
-
-        """
-
-        assert isinstance(in_type.gspace, GSpace)
-
-        super(Softmax, self).__init__()
-
-        for r in in_type.representations:
-            assert 'pointwise' in r.supported_nonlinearities, \
-                'Error! Representation "{}" does not support "pointwise" non-linearity'.format(r.name)
-
-        self.space = in_type.gspace
-        self.in_type = in_type
-
-        # the representation in input is preserved
-        self.out_type = in_type
-
-    def forward(self, input: GeometricTensor) -> GeometricTensor:
-        r"""
-
-        Applies softmax function on the input fields
-
-        Args:
-            input (GeometricTensor): the input feature map
-
-        Returns:
-            the resulting feature map after elu has been applied
-
-        """
-        assert input.type == self.in_type
-        return GeometricTensor(
-            F.softmax(input.tensor, dim=-1),
-            self.out_type, input.coords
-        )
-
-    def evaluate_output_shape(self, input_shape: Tuple[int, ...]) -> Tuple[int, ...]:
-
-        assert len(input_shape) >= 2
-        assert input_shape[1] == self.in_type.size
-
-        b, c = input_shape[:2]
-        spatial_shape = input_shape[2:]
-
-        return (b, self.out_type.size, *spatial_shape)
-
-    def check_equivariance(self, atol: float = 1e-6, rtol: float = 1e-5) -> List[Tuple[Any, float]]:
-
-        c = self.in_type.size
-
-        x = torch.randn(3, c, 10, 10)
-
-        x = GeometricTensor(x, self.in_type)
-
-        errors = []
-
-        for el in self.space.testing_elements:
-            out1 = self(x).transform_fibers(el)
-            out2 = self(x.transform_fibers(el))
-
-            errs = (out1.tensor - out2.tensor).detach().numpy()
-            errs = np.abs(errs).reshape(-1)
-            print(el, errs.max(), errs.mean(), errs.var())
-
-            assert torch.allclose(out1.tensor, out2.tensor, atol=atol, rtol=rtol), \
-                'The error found during equivariance check with element "{}" is too high: max = {}, mean = {} var ={}' \
-                    .format(el, errs.max(), errs.mean(), errs.var())
-
-            errors.append((el, errs.mean()))
-
-        return errors
-
-    def extra_repr(self):
-        return 'type={}'.format(
-            self.in_type
-        )
-
-    def export(self):
-        r"""
-        Export this module to a normal PyTorch :class:`torch.nn.ELU` module and set to "eval" mode.
-
-        """
-
-        self.eval()
-
-        return torch.nn.ELU(alpha=self.alpha, inplace=self._inplace)

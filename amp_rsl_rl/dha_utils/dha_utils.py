@@ -96,36 +96,48 @@ def compute_ms_observations(critic_obs, joint_order_for_morphosymm, amp_joint_na
         concatenated_joint_data_start_idx = 60
         ms_critic_obs_start = critic_obs[:, :concatenated_joint_data_start_idx]
         num_joints_amp = len(amp_joint_names) # Get this from amp_joint_names, not self.amp_joint_names if passed in
-        num_joints_ms_order = len(joint_order_for_morphosymm) # Get this from the argument
 
         joint_angles_ms_list = []
         joint_vels_ms_list = []
 
-        obs_set_size = 3 * num_joints_amp
-
-
         for i in range(10):
-            current_set_start_idx = concatenated_joint_data_start_idx + (i * obs_set_size)
+            current_set_start_idx = concatenated_joint_data_start_idx + (i * num_joints_amp)
 
             current_joint_angles = critic_obs[:, current_set_start_idx : current_set_start_idx + num_joints_amp]
             joint_angles_ms_list.append(isaaclab_joints_to_ms(current_joint_angles, joint_order_for_morphosymm, amp_joint_names))
 
-            current_joint_vels = critic_obs[:, current_set_start_idx + num_joints_amp : current_set_start_idx + (2 * num_joints_amp)]
+            current_vel_set_start_idx = current_set_start_idx + (10 * num_joints_amp)
+            current_joint_vels = critic_obs[:, current_vel_set_start_idx : current_vel_set_start_idx + num_joints_amp]
             joint_vels_ms_list.append(isaaclab_joints_to_ms(current_joint_vels, joint_order_for_morphosymm, amp_joint_names))
 
         joint_angles_ms_all = torch.cat(joint_angles_ms_list, dim=-1)
         joint_vels_ms_all = torch.cat(joint_vels_ms_list, dim=-1)
 
-        current_past_action = critic_obs[:, current_set_start_idx + (2 * num_joints_amp) : current_set_start_idx + (3 * num_joints_amp)]
+        current_past_action = critic_obs[:, current_vel_set_start_idx + num_joints_amp : current_vel_set_start_idx + (2 * num_joints_amp)]
         past_action_ms = isaaclab_joints_to_ms(current_past_action, joint_order_for_morphosymm, amp_joint_names)
+
+        commands = critic_obs[:, current_vel_set_start_idx + (2 * num_joints_amp):]
 
         ms_critic_obs = torch.cat([
             ms_critic_obs_start,
             joint_angles_ms_all,
             joint_vels_ms_all,
             past_action_ms,
-            critic_obs[:, concatenated_joint_data_start_idx + (10 * obs_set_size):]
+            commands,
         ], dim=-1)
+
+        ms_critic_obs = ms_critic_obs.to(dtype=critic_obs.dtype)
+        ms_critic_obs = ms_critic_obs.to(device=critic_obs.device)
+
+        return ms_critic_obs
+
+def compute_ms_observations_dae(critic_obs, joint_order_for_morphosymm, amp_joint_names) -> torch.Tensor:
+        # TODO this set of obs is only for the flat task
+        joint_angles_ms = isaaclab_joints_to_ms(critic_obs[:, 186:200], joint_order_for_morphosymm, amp_joint_names)
+        joint_vels_ms = isaaclab_joints_to_ms(critic_obs[:, 326:340], joint_order_for_morphosymm, amp_joint_names)
+        past_action_ms = isaaclab_joints_to_ms(critic_obs[:, 340:354], joint_order_for_morphosymm, amp_joint_names)
+
+        ms_critic_obs = torch.cat([critic_obs[:, 27:30], critic_obs[:, 57:60], joint_angles_ms, joint_vels_ms, past_action_ms, critic_obs[:, 354:357]], dim=-1)
 
         ms_critic_obs = ms_critic_obs.to(dtype=critic_obs.dtype)
         ms_critic_obs = ms_critic_obs.to(device=critic_obs.device)
@@ -192,7 +204,7 @@ def safe_standardize(x_normed: torch.Tensor | np.ndarray, mean: torch.Tensor | n
         x_normed[:, :, mask] = (x_normed[:, :, mask] - mean[mask]) / std[mask]
     return x_normed
 
-def get_trained_dae_model(model_dir, G):
+def get_trained_dae_model(model_dir, G, is_ideal: bool = False):
     """
     Load the trained DAE model.
 
@@ -223,7 +235,10 @@ def get_trained_dae_model(model_dir, G):
     rep_euler_z.name = "euler_z"
 
     # Define the state and action type using the extracted representations
-    state_reps = [rep_Rd, rep_euler_xyz, rep_Rd, rep_TqQ_js, rep_TqQ_js, rep_TqQ_js, rep_xy, rep_euler_z] # ['base_vel', 'base_ang_vel', 'projected_gravity', 'joint_pos', 'joint_vel', 'prev_action', 'velocity_commands_xy', 'velocity_commands_z']
+    if is_ideal:
+        state_reps = [rep_Rd, rep_euler_xyz, rep_Rd, rep_TqQ_js, rep_TqQ_js, rep_TqQ_js, rep_xy, rep_euler_z] # ['base_vel', 'base_ang_vel', 'projected_gravity', 'joint_pos', 'joint_vel', 'prev_action', 'velocity_commands_xy', 'velocity_commands_z']
+    else:
+        state_reps = [rep_euler_xyz, rep_Rd, rep_TqQ_js, rep_TqQ_js, rep_TqQ_js, rep_xy, rep_euler_z] # ['base_ang_vel', 'projected_gravity', 'joint_pos', 'joint_vel', 'prev_action', 'velocity_commands_xy', 'velocity_commands_z']
     state_type = FieldType(gspace, representations=state_reps)
     state_type.size = sum(rep.size for rep in state_reps) + rep_Rd.size + 2 * rep_TqQ_js.size  # Count duplicates twice
     state_type = FieldType(gspace, representations=state_reps)

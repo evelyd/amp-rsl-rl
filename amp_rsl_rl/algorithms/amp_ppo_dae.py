@@ -21,7 +21,7 @@ from rsl_rl.modules import ActorCritic
 from amp_rsl_rl.networks import Discriminator
 from amp_rsl_rl.utils import AMPLoader
 from amp_rsl_rl.algorithms.amp_ppo import AMP_PPO
-from amp_rsl_rl.dha_utils import get_trained_dae_model,load_normalization_stats, safe_standardize, compute_ms_observations, compute_ms_observations_ideal
+from amp_rsl_rl.dha_utils import get_trained_dae_model,load_normalization_stats, safe_standardize, compute_ms_observations, compute_ms_observations_ideal, compute_ms_observations_dae
 
 import amp_ergocub
 from escnn.nn import GeometricTensor
@@ -89,7 +89,7 @@ class AMP_PPO_DAE(AMP_PPO):
         # DAE specific initialization
         self.model_path = model_path
         full_model_path = os.path.join(os.path.dirname(amp_ergocub.__file__), self.model_path)
-        self.dae_model = get_trained_dae_model(full_model_path, G)
+        self.dae_model = get_trained_dae_model(full_model_path, G, is_ideal=is_ideal)
         print(f"Using DAE model from {full_model_path}")
         self.state_mean, self.state_std, self.action_mean, self.action_std = load_normalization_stats(full_model_path, self.device)
 
@@ -103,7 +103,9 @@ class AMP_PPO_DAE(AMP_PPO):
         if self.is_ideal:
             dae_input = compute_ms_observations_ideal(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)
         else:
-            dae_input = compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)
+            #TODO for the input to the DAE, I should only use the most recent ts of measurements, not the whole history, and rn it's using the whole history
+            # i guess for the actor it's fine this way but for the dae it needs to change
+            dae_input = compute_ms_observations_dae(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)
         dae_input_normed = safe_standardize(dae_input, self.state_mean, self.state_std)
 
         # Wrap as GeometricTensor for E-DAE/EC-DAE
@@ -112,7 +114,11 @@ class AMP_PPO_DAE(AMP_PPO):
             latent = self.dae_model.obs_fn(dae_input_normed).tensor.detach()
         else:
             latent = self.dae_model.obs_fn(dae_input_normed).detach()
-        return latent
+
+        if "Symm" in type(self.actor_critic).__name__:
+            return torch.cat((compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
+        else:
+            return torch.cat((critic_obs, latent), dim=-1)
 
     def act(self, obs: torch.Tensor, critic_obs: torch.Tensor) -> torch.Tensor:
         """
@@ -137,7 +143,7 @@ class AMP_PPO_DAE(AMP_PPO):
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute actions and related statistics, ensuring we detach tensors to avoid gradient issues.
-        if type(self.actor_critic).__name__ == "ActorCriticMoESymm":
+        if "Symm" in type(self.actor_critic).__name__:
             if self.is_ideal:
                     self.transition.actions = self.actor_critic.act(compute_ms_observations_ideal(obs, self.joint_order_for_morphosymm, self.amp_joint_names)).detach()
             else:
@@ -243,9 +249,9 @@ class AMP_PPO_DAE(AMP_PPO):
 
             # Forward pass through the actor to get current policy outputs.
             if self.is_ideal:
-                obs_batch_ms = self.actor_critic.compute_ms_observations_ideal(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
+                obs_batch_ms = compute_ms_observations_ideal(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
             else:
-                obs_batch_ms = self.actor_critic.compute_ms_observations(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
+                obs_batch_ms = compute_ms_observations(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
 
             self.actor_critic.act(
                 obs_batch_ms, masks=masks_batch, hidden_states=hid_states_batch[0]

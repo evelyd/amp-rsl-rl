@@ -228,7 +228,7 @@ class AMP_PPO:
         if self.actor_critic.is_recurrent:
             self.transition.hidden_states = self.actor_critic.get_hidden_states()
         # Compute actions and related statistics, ensuring we detach tensors to avoid gradient issues.
-        if type(self.actor_critic).__name__ == "ActorCriticMoESymm":
+        if type(self.actor_critic).__name__ == "ActorCriticMoESymm" or type(self.actor_critic).__name__ == "ActorCriticSymm":
             if self.is_ideal:
                 self.transition.actions = self.actor_critic.act(compute_ms_observations_ideal(obs, self.joint_order_for_morphosymm, self.amp_joint_names)).detach()
                 self.transition.values = self.actor_critic.evaluate(compute_ms_observations_ideal(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)).detach()
@@ -315,7 +315,7 @@ class AMP_PPO:
         last_critic_obs : torch.Tensor
             The critic observation after the last environment step.
         """
-        if type(self.actor_critic).__name__ == "ActorCriticMoESymm":
+        if type(self.actor_critic).__name__ == "ActorCriticMoESymm" or type(self.actor_critic).__name__ == "ActorCriticSymm":
             if self.is_ideal:
                 last_values = self.actor_critic.evaluate(compute_ms_observations_ideal(last_critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)).detach()
             else:
@@ -437,7 +437,7 @@ class AMP_PPO:
                 rnd_state_batch,
             ) = sample
 
-            if type(self.actor_critic).__name__ == "ActorCriticMoESymm":
+            if type(self.actor_critic).__name__ == "ActorCriticMoESymm" or type(self.actor_critic).__name__ == "ActorCriticSymm":
                 if self.is_ideal:
                     obs_batch = compute_ms_observations_ideal(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
                     critic_obs_batch = compute_ms_observations_ideal(critic_obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)

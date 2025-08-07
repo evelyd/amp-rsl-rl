@@ -22,7 +22,7 @@ from rsl_rl.utils import store_code_state
 from amp_rsl_rl.utils import Normalizer
 from amp_rsl_rl.utils import AMPLoader
 from amp_rsl_rl.algorithms import AMP_PPO, AMP_PPO_DAE
-from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm
+from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm, ActorCriticSymm
 from amp_rsl_rl.utils import export_policy_as_onnx
 from amp_rsl_rl.runners import AMPOnPolicyRunner
 
@@ -59,35 +59,47 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         robot, G = load_symmetric_system(robot_name="ergocub")
         joint_order_for_morphosymm = robot.joint_space_names
 
+        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
+
         # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
         amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
         ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
         is_ideal = False
         if num_obs == 90:
             ms_critic_obs = num_critic_obs + 3 * ms_joint_difference
+            dae_input_size = ms_critic_obs
             is_ideal = True
         elif num_obs == 357:
             ms_critic_obs = num_critic_obs + (10 * 2 + 1) * ms_joint_difference
+            dae_input_size = num_critic_obs - 9 * (3 + 3 + len(amp_joint_names) + len(amp_joint_names)) + 3 * ms_joint_difference
+
         if alg_class == AMP_PPO_DAE:
+            is_dae = True
             # Scale the number of critic obs based on the DAE state to latent state ratio, accounting for the difference in joint space
             obs_state_ratio = self.cfg["obs_state_ratio"]
-            ac_critic_obs = ms_critic_obs * obs_state_ratio
+            if actor_critic_class == ActorCriticMoESymm or actor_critic_class == ActorCriticSymm:
+                # if symm and dae, the critic obs is the morphosymm obs + the latent state
+                ac_critic_obs = ms_critic_obs + dae_input_size * obs_state_ratio
+            else:
+                # if dae but not symm, the critic obs is the regular obs + the latent state
+                ac_critic_obs = num_critic_obs + dae_input_size * obs_state_ratio
         else:
             obs_state_ratio = 1
             ac_critic_obs = ms_critic_obs
+            is_dae = False
 
-        actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        if actor_critic_class == ActorCriticMoESymm:
-                        actor_critic: ActorCriticMoESymm = (
+        if actor_critic_class == ActorCriticMoESymm or actor_critic_class == ActorCriticSymm:
+            actor_critic: ActorCriticMoESymm | ActorCriticSymm = (
                 actor_critic_class(
                     num_actor_obs=num_obs,
                     num_critic_obs=ac_critic_obs,
                     num_actions=self.env.num_actions,
-                    is_dae=True,
+                    is_dae=is_dae,
                     G=G,
                     obs_state_ratio=obs_state_ratio,
                     amp_joint_names=amp_joint_names,
                     joint_order_for_morphosymm=joint_order_for_morphosymm,
+                    is_ideal=is_ideal,
                     **self.policy_cfg
                 ).to(self.device)
             )
