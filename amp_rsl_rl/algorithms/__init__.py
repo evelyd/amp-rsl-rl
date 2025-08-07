@@ -6,5 +6,6 @@
 """Implementation of different RL agents using AMP."""
 
 from .amp_ppo import AMP_PPO
+from .amp_ppo_dae import AMP_PPO_DAE
 
-__all__ = ["AMP_PPO"]
+__all__ = ["AMP_PPO", "AMP_PPO_DAE"]

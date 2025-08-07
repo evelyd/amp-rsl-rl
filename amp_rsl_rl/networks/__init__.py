@@ -8,5 +8,6 @@
 
 from .discriminator import Discriminator
 from .ac_moe import ActorMoE, ActorCriticMoE
+from .ac_moe_symm import ActorCriticMoESymm, ActorMoESymm, ExportedActorMoESymm
 
-__all__ = ["Discriminator", "ActorCriticMoE", "ActorMoE"]
+__all__ = ["Discriminator", "ActorCriticMoE", "ActorMoE", "ActorCriticMoESymm", "ActorMoESymm", "ExportedActorMoESymm"]

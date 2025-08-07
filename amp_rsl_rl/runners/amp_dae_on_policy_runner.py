@@ -15,112 +15,22 @@ import torch
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
 import rsl_rl
-import rsl_rl.utils
 from rsl_rl.env import VecEnv
 from rsl_rl.modules import ActorCritic, ActorCriticRecurrent, EmpiricalNormalization
 from rsl_rl.utils import store_code_state
 
 from amp_rsl_rl.utils import Normalizer
 from amp_rsl_rl.utils import AMPLoader
-from amp_rsl_rl.algorithms import AMP_PPO
+from amp_rsl_rl.algorithms import AMP_PPO, AMP_PPO_DAE
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm
 from amp_rsl_rl.utils import export_policy_as_onnx
+from amp_rsl_rl.runners import AMPOnPolicyRunner
 
-class AMPOnPolicyRunner:
+class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
     """
-    AMPOnPolicyRunner is a high-level orchestrator that manages the training and evaluation
-    of a policy using Adversarial Motion Priors (AMP) combined with on-policy reinforcement learning (PPO).
+    This implementation of the AMP DAE on-policy runner is based on the AMP PPO algorithm. The only change from the regular AMP is that it uses the latent state from the DAE encoder as an extra critic obs.
 
-    It brings together multiple components:
-    - Environment (`VecEnv`)
-    - Policy (`ActorCritic`, `ActorCriticRecurrent`)
-    - Discriminator (Discriminator)
-    - Expert dataset (AMPLoader)
-    - Reward combination (task + style)
-    - Logging and checkpointing
-
-    ---
-    🔧 Configuration
-    ----------------
-    The class expects a `train_cfg` dictionary structured with keys:
-    - "policy": configuration for the policy network, including `"class_name"`
-    - "algorithm": configuration for PPO/AMP_PPO, including `"class_name"`
-    - "discriminator": configuration for the AMP discriminator
-    - "amp_data_path": path to folder containing expert dataset(s)
-    - "dataset_names": list of dataset filenames (without `.npy`)
-    - "dataset_weights": list of float weights used to sample from datasets
-    - "slow_down_factor": slowdown applied to real motion data to match sim dynamics
-    - "num_steps_per_env": rollout horizon per environment
-    - "save_interval": frequency (in iterations) for model checkpointing
-    - "empirical_normalization": whether to apply running observation normalization
-    - "logger": one of "tensorboard", "wandb", or "neptune"
-
-    ---
-    📦 Dataset format
-    ------------------
-    The expert motion datasets loaded via `AMPLoader` must be `.npy` files with a dictionary containing:
-
-    - `"joints_list"`: List[str] — ordered list of joint names
-    - `"joint_positions"`: List[np.ndarray] — joint configurations per timestep (1D arrays)
-    - `"root_position"`: List[np.ndarray] — base position in world coordinates
-    - `"root_quaternion"`: List[np.ndarray] — base orientation in **`xyzw`** format (SciPy default)
-    - `"fps"`: float — original dataset frame rate
-
-    Internally:
-    - Quaternions are interpolated via SLERP and converted to **`wxyz`** format before being used by the model (to match Isaac Gym convention).
-    - Velocities are estimated with finite differences.
-    - All data is converted to torch tensors and placed on the desired device.
-
-    ---
-    🎓 AMP Reward
-    -------------
-    During each training step, the runner collects AMP-specific observations and computes
-    a discriminator-based "style reward" from the expert dataset. This is combined
-    with the environment reward as:
-
-        `reward = 0.5 * task_reward + 0.5 * style_reward`
-
-    This can be later generalized into a weighted or learned reward mixing policy.
-
-    ---
-    🔁 Training loop
-    ----------------
-    The `learn()` method performs:
-    - `rollout`: collects data via `self.alg.act()` and `env.step()`
-    - `style_reward`: computed from discriminator via `predict_reward(...)`
-    - `storage update`: via `process_env_step()` and `process_amp_step()`
-    - `return computation`: via `compute_returns()`
-    - `update`: performs backpropagation with `self.alg.update()`
-    - Logging via TensorBoard/WandB/Neptune
-
-    ---
-    💾 Saving and ONNX export
-    --------------------------
-    At each `save_interval`, the runner:
-    - Saves the full state (`model`, `optimizer`, `discriminator`, `normalizer`, etc.)
-    - Optionally exports the policy as an ONNX model for deployment
-    - Uploads checkpoints to logging services if enabled
-
-    ---
-    📤 Inference policy
-    -------------------
-    `get_inference_policy()` returns a callable that takes an observation and returns an action.
-    If empirical normalization is enabled, observations are normalized before inference.
-
-    ---
-    🛠️ Additional tools
-    -------------------
-    - Git integration via `store_code_state()` to track code changes
-    - Logging of learning statistics, reward breakdown, discriminator metrics
-    - Compatible with multi-task setups via dataset weights
-
-    ---
-    📚 Notes
-    --------
-    - This runner assumes an AMP-compatible VecEnv, providing `observations["amp"]`
-    - AMP uses both current and next state to train the discriminator
-    - Logging behavior is separated from core logic (WandB, Neptune, TensorBoard)
-    - The Discriminator and AMP_PPO must follow expected APIs
+    This runner works for EMLP, C-DAE, EC-DAE, and combinations of those. It won't work for the case without any of these, and for that it is necessary to use the AMPOnPolicyRunner directly.
 
     """
 
@@ -140,26 +50,53 @@ class AMPOnPolicyRunner:
         else:
             num_critic_obs = num_obs
 
+        # Initialize the PPO algorithm
+        alg_class = eval(self.alg_cfg.pop("class_name"))  # AMP_PPO
+
+        # Define the state representation
+        # G is the symmetry group of the system
+        from morpho_symm.utils.robot_utils import load_symmetric_system
+        robot, G = load_symmetric_system(robot_name="ergocub")
+        joint_order_for_morphosymm = robot.joint_space_names
+
+        # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
+        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
+        ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
+        is_ideal = False
+        if num_obs == 90:
+            ms_critic_obs = num_critic_obs + 3 * ms_joint_difference
+            is_ideal = True
+        elif num_obs == 357:
+            ms_critic_obs = num_critic_obs + (10 * 2 + 1) * ms_joint_difference
+        if alg_class == AMP_PPO_DAE:
+            # Scale the number of critic obs based on the DAE state to latent state ratio, accounting for the difference in joint space
+            obs_state_ratio = self.cfg["obs_state_ratio"]
+            ac_critic_obs = ms_critic_obs * obs_state_ratio
+        else:
+            obs_state_ratio = 1
+            ac_critic_obs = ms_critic_obs
+
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
         if actor_critic_class == ActorCriticMoESymm:
-            # Define the state representation
-            # G is the symmetry group of the system
-            from morpho_symm.utils.robot_utils import load_symmetric_system
-            robot, G = load_symmetric_system(robot_name="ergocub")
-            joint_order_for_morphosymm = robot.joint_space_names
-            actor_critic: ActorCriticMoESymm = (
+                        actor_critic: ActorCriticMoESymm = (
                 actor_critic_class(
-                    num_obs, num_critic_obs, self.env.num_actions, True, amp_joint_names, joint_order_for_morphosymm, G, self.cfg["obs_state_ratio"],**self.policy_cfg
+                    num_actor_obs=num_obs,
+                    num_critic_obs=ac_critic_obs,
+                    num_actions=self.env.num_actions,
+                    is_dae=True,
+                    G=G,
+                    obs_state_ratio=obs_state_ratio,
+                    amp_joint_names=amp_joint_names,
+                    joint_order_for_morphosymm=joint_order_for_morphosymm,
+                    **self.policy_cfg
                 ).to(self.device)
             )
         else:
             actor_critic: ActorCritic | ActorCriticRecurrent | ActorCriticMoE = (
                 actor_critic_class(
-                    num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
+                    num_obs, ac_critic_obs, self.env.num_actions, **self.policy_cfg
                 ).to(self.device)
             )
-        # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
-        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
 
         delta_t = self.env.cfg.sim.dt * self.env.cfg.decimation
 
@@ -187,25 +124,43 @@ class AMPOnPolicyRunner:
             device=self.device,
         ).to(self.device)
 
-        # Initialize the PPO algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))  # AMP_PPO
         # This removes from alg_cfg fields that are not in AMP_PPO but are introduced in rsl_rl 2.2.3 PPO
         # normalize_advantage_per_mini_batch=False,
         # rnd_cfg: dict | None = None,
         # symmetry_cfg: dict | None = None,
         # multi_gpu_cfg: dict | None = None,
         for key in list(self.alg_cfg.keys()):
-            if key not in AMP_PPO.__init__.__code__.co_varnames:
+            if key not in alg_class.__init__.__code__.co_varnames:
                 self.alg_cfg.pop(key)
 
-        self.alg: AMP_PPO = alg_class(
+        if alg_class == AMP_PPO_DAE:
+            dae_model_path = self.cfg["model_path"]
+            self.alg: AMP_PPO_DAE = alg_class(
+                model_path=dae_model_path,
+                actor_critic=actor_critic,
+                discriminator=self.discriminator,
+                amp_data=amp_data,
+                amp_normalizer=self.amp_normalizer,
+                device=self.device,
+                G=G,
+                is_ideal=is_ideal,
+                amp_joint_names=amp_joint_names,
+                joint_order_for_morphosymm=joint_order_for_morphosymm,
+                **self.alg_cfg,
+            )
+        else:
+            self.alg: AMP_PPO = alg_class(
             actor_critic=actor_critic,
             discriminator=self.discriminator,
             amp_data=amp_data,
             amp_normalizer=self.amp_normalizer,
             device=self.device,
+            is_ideal=is_ideal,
+            amp_joint_names=amp_joint_names,
+            joint_order_for_morphosymm=joint_order_for_morphosymm,
             **self.alg_cfg,
         )
+
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
         self.empirical_normalization = self.cfg["empirical_normalization"]
@@ -235,6 +190,8 @@ class AMPOnPolicyRunner:
         self.tot_time = 0
         self.current_learning_iteration = 0
         self.git_status_repos = [rsl_rl.__file__]
+
+        input(f"alg class: {alg_class}, actor critic class: {actor_critic_class}")
 
     def learn(self, num_learning_iterations: int, init_at_random_ep_len: bool = False):
         # initialize writer
@@ -422,7 +379,7 @@ class AMPOnPolicyRunner:
             self.current_learning_iteration = it
             if self.log_dir is not None:
                 self.log(locals())
-            if it % self.save_interval == 0:
+            if it % self.save_interval == 0:\
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
             ep_infos.clear()
             if it == start_iter:
