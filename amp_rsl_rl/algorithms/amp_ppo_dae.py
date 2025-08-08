@@ -248,14 +248,20 @@ class AMP_PPO_DAE(AMP_PPO):
             ) = sample
 
             # Forward pass through the actor to get current policy outputs.
-            if self.is_ideal:
-                obs_batch_ms = compute_ms_observations_ideal(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
-            else:
-                obs_batch_ms = compute_ms_observations(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
-
-            self.actor_critic.act(
+            #ideal is regardless of dae, emlp setting. if emlp, emlp+ecdae: use obs ms. if cdae, use raw obs
+            if "Symm" in type(self.actor_critic).__name__:
+                if self.is_ideal:
+                    obs_batch_ms = compute_ms_observations_ideal(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
+                else:
+                    obs_batch_ms = compute_ms_observations(obs_batch, self.joint_order_for_morphosymm, self.amp_joint_names)
+                self.actor_critic.act(
                 obs_batch_ms, masks=masks_batch, hidden_states=hid_states_batch[0]
             )
+            else:
+                self.actor_critic.act(
+                obs_batch, masks=masks_batch, hidden_states=hid_states_batch[0]
+            )
+
             actions_log_prob_batch = self.actor_critic.get_actions_log_prob(
                 actions_batch
             )
