@@ -124,13 +124,15 @@ class AMPOnPolicyRunner:
 
     """
 
-    def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
+    def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu", video_interval=None, video_length=None):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.discriminator_cfg = train_cfg["discriminator"]
         self.device = device
         self.env = env
+        self.video_interval = video_interval
+        self.video_length = video_length
 
         # Get the size of the observation space
         obs, extras = self.env.get_observations()
@@ -299,6 +301,10 @@ class AMPOnPolicyRunner:
                 self.writer.log_config(
                     self.env.cfg, self.cfg, self.alg_cfg, self.policy_cfg
                 )
+
+                video_folder = os.path.join(self.log_dir, "videos", "train")
+                logged_videos = []
+
             elif self.logger_type == "tensorboard":
                 self.writer = TensorboardSummaryWriter(
                     log_dir=self.log_dir, flush_secs=10
@@ -432,6 +438,25 @@ class AMPOnPolicyRunner:
                 if self.logger_type in ["wandb", "neptune"] and git_file_paths:
                     for path in git_file_paths:
                         self.writer.save_file(path)
+
+            if self.logger_type == "wandb":
+                # List all video files that end with .mp4
+                video_files = [f for f in os.listdir(video_folder) if f.endswith('.mp4')]
+
+                # Log any new video files that haven't been logged yet
+                for video_file in video_files:
+                    video_path = os.path.join(video_folder, video_file)
+                    if video_path not in logged_videos:
+                        print(f"Found new video: {video_path}. Logging to wandb...")
+
+                        # Create a wandb.Video object from the file
+                        wandb_video = wandb.Video(video_path, fps=30, format="mp4")
+
+                        # Log the video to W&B
+                        wandb.log({"training_video": wandb_video}, step=self.current_learning_iteration)
+
+                        # Add the video to our list of logged videos
+                        logged_videos.append(video_path)
 
         self.save(
             os.path.join(self.log_dir, f"model_{self.current_learning_iteration}.pt"),
