@@ -38,7 +38,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from amp_rsl_rl.dha_utils import ms_joints_to_isaaclab
+from amp_rsl_rl.dha_utils import ms_joints_to_isaaclab, compute_ms_observations, compute_ms_observations_ideal
 
 class ActorCriticSymm(nn.Module):
     is_recurrent = False
@@ -151,9 +151,14 @@ class ActorCriticSymm(nn.Module):
 
         # Construct the equivariant MLP
 
-        self.actor = SimpleEMLP(in_field_type, out_field_type,
-            hidden_dims = actor_hidden_dims,
-            activation = activation,)
+        self.actor = ActorEMLP(in_field_type,
+                               out_field_type,
+                               hidden_dims=actor_hidden_dims,
+                               activation=activation,
+                               is_ideal=is_ideal,
+                               amp_joint_names=amp_joint_names,
+                               joint_order_for_morphosymm=joint_order_for_morphosymm)
+
 
         self.critic = SimpleEMLP(critic_in_field_type, critic_out_field_type,
             hidden_dims = critic_hidden_dims,
@@ -312,8 +317,91 @@ class SimpleEMLP(EquivariantModule):
         return batch_size, self.out_type.size
 
     def export(self):
-        """Exports the model to a torch.nn.Sequential instance."""
-        sequential = nn.Sequential()
+        # This remains the same: it exports the core equivariant network to a standard Sequential module
+        exported_net = nn.Sequential()
         for name, module in self.net.named_children():
-            sequential.add_module(name, module.export())
-        return sequential
+            exported_net.add_module(name, module.export())
+
+        # Instantiate the wrapper with all required parameters
+        exported_model = ExportedActorEMLP(
+            emlp_net=exported_net,
+            in_field_type=self.in_field_type,
+            ms_obs_field_type=self.ms_obs_field_type, # Pass the new field type here
+            extra_layer=self.extra_layer,
+            is_ideal=self.is_ideal,
+            amp_joint_names=self.amp_joint_names,
+            joint_order_for_morphosymm=self.joint_order_for_morphosymm
+        )
+        return exported_model
+
+class ExportedActorEMLP(nn.Module):
+    def __init__(self, emlp_net, in_field_type, extra_layer, is_ideal, amp_joint_names, joint_order_for_morphosymm):
+        super().__init__()
+        self.emlp_net = emlp_net
+        self.in_field_type = in_field_type
+        self.extra_layer = extra_layer
+        self.is_ideal = is_ideal
+        self.amp_joint_names = amp_joint_names
+        self.joint_order_for_morphosymm = joint_order_for_morphosymm
+
+        # Compute the size of the input tensor
+        ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
+        if self.is_ideal:
+            self.actor_input_size = self.in_field_type.size - ms_joint_difference * 3
+        else:
+            self.actor_input_size = self.in_field_type.size - (10 * 2 + 1) * ms_joint_difference
+
+    def forward(self, x_tensor: torch.Tensor) -> torch.Tensor:
+        # Convert to morphosymm-compatible tensor (adding joints)
+        if self.is_ideal:
+            expanded_tensor = compute_ms_observations_ideal(
+                x_tensor, self.joint_order_for_morphosymm, self.amp_joint_names)
+        else:
+            expanded_tensor = compute_ms_observations(x_tensor, self.joint_order_for_morphosymm, self.amp_joint_names)
+
+        # Put it in a geometric tensor to encode symmetries
+        x_geometric = self.in_field_type(expanded_tensor)
+
+        out_geometric = self.emlp_net(x_geometric.tensor)
+
+        if self.extra_layer:
+            out_tensor = self.extra_layer(out_geometric.tensor)
+        else:
+            out_tensor = out_geometric
+
+        return out_tensor
+
+class ActorEMLP(SimpleEMLP):
+    def __init__(self,
+                 in_type: FieldType,
+                 out_type: FieldType,
+                 hidden_dims = [256, 256, 256],
+                 bias: bool = True,
+                 actor: bool = True,
+                 activation: str = "ReLU",
+                 is_ideal: bool = False,
+                 amp_joint_names: list[str] = [],
+                 joint_order_for_morphosymm: list[str] = []
+                 ):
+        super().__init__(in_type, out_type, hidden_dims, bias, actor, activation)
+        self.in_field_type = in_type
+        self.is_ideal = is_ideal
+        self.amp_joint_names = amp_joint_names
+        self.joint_order_for_morphosymm = joint_order_for_morphosymm
+
+    def export(self):
+        # This remains the same: it exports the core equivariant network to a standard Sequential module
+        exported_net = nn.Sequential()
+        for name, module in self.net.named_children():
+            exported_net.add_module(name, module.export())
+
+        # Instantiate the wrapper with all required parameters
+        exported_model = ExportedActorEMLP(
+            emlp_net=exported_net,
+            in_field_type=self.in_field_type,
+            extra_layer=self.extra_layer,
+            is_ideal=self.is_ideal,
+            amp_joint_names=self.amp_joint_names,
+            joint_order_for_morphosymm=self.joint_order_for_morphosymm
+        )
+        return exported_model

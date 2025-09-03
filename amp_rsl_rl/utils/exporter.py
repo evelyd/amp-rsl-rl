@@ -8,7 +8,7 @@
 import copy
 import os
 import torch
-from amp_rsl_rl.networks import ActorMoE, ActorMoESymm, ExportedActorMoESymm, SimpleEMLP
+from amp_rsl_rl.networks import ActorMoE, ActorMoESymm, ExportedActorMoESymm, SimpleEMLP, ActorEMLP, ExportedActorEMLP
 
 
 def export_policy_as_onnx(
@@ -97,7 +97,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
     def __init__(self, actor_critic, normalizer=None, verbose=False):
         super().__init__()
         self.verbose = verbose
-        if isinstance(actor_critic.actor, ActorMoESymm) or isinstance(actor_critic.actor, SimpleEMLP):
+        if isinstance(actor_critic.actor, ActorMoESymm) or isinstance(actor_critic.actor, ActorEMLP):
             temp_actor_copy = copy.deepcopy(actor_critic.actor)
             temp_actor_copy.cpu()
             temp_actor_copy.eval()
@@ -146,6 +146,7 @@ class _OnnxPolicyExporter(torch.nn.Module):
             obs = (
                 torch.zeros(1, self.actor.ms_obs_dim)
                 if isinstance(self.actor, ActorMoE) or isinstance(self.actor, ExportedActorMoESymm)
+                else torch.zeros(1, self.actor.actor_input_size) if isinstance(self.actor, ExportedActorEMLP)
                 else torch.zeros(1, self.actor[0].in_features)
             )
             torch.onnx.export(
