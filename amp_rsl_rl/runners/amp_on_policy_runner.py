@@ -23,7 +23,7 @@ from rsl_rl.utils import store_code_state
 from amp_rsl_rl.utils import Normalizer
 from amp_rsl_rl.utils import AMPLoader
 from amp_rsl_rl.algorithms import AMP_PPO
-from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm
+from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm, ActorCriticSymm
 from amp_rsl_rl.utils import export_policy_as_onnx
 
 class AMPOnPolicyRunner:
@@ -142,16 +142,32 @@ class AMPOnPolicyRunner:
         else:
             num_critic_obs = num_obs
 
+        # Define the state representation
+        # G is the symmetry group of the system
+        from morpho_symm.utils.robot_utils import load_symmetric_system
+        robot, G = load_symmetric_system(robot_name="ergocub")
+        joint_order_for_morphosymm = robot.joint_space_names
+        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
+        ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
+        is_ideal = False
+        if num_obs == 90:
+            ms_critic_obs = num_critic_obs + 3 * ms_joint_difference
+            is_ideal = True
+        elif num_obs == 357:
+            ms_critic_obs = num_critic_obs + (10 * 2 + 1) * ms_joint_difference
+
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
-        if actor_critic_class == ActorCriticMoESymm:
-            # Define the state representation
-            # G is the symmetry group of the system
-            from morpho_symm.utils.robot_utils import load_symmetric_system
-            robot, G = load_symmetric_system(robot_name="ergocub")
-            joint_order_for_morphosymm = robot.joint_space_names
-            actor_critic: ActorCriticMoESymm = (
+        if actor_critic_class == ActorCriticMoESymm or actor_critic_class == ActorCriticSymm:
+            actor_critic: ActorCriticMoESymm | ActorCriticSymm = (
                 actor_critic_class(
-                    num_obs, num_critic_obs, self.env.num_actions, True, amp_joint_names, joint_order_for_morphosymm, G, self.cfg["obs_state_ratio"],**self.policy_cfg
+                    num_actor_obs=num_obs,
+                    num_critic_obs=ms_critic_obs,
+                    num_actions=self.env.num_actions,
+                    is_dae=False,
+                    G=G,
+                    amp_joint_names=amp_joint_names, joint_order_for_morphosymm=joint_order_for_morphosymm,
+                    is_ideal=is_ideal,
+                    **self.policy_cfg
                 ).to(self.device)
             )
         else:
@@ -161,7 +177,6 @@ class AMPOnPolicyRunner:
                 ).to(self.device)
             )
         # NOTE: to use this we need to configure the observations in the env coherently with amp observation. Tested with Manager Based envs in Isaaclab
-        amp_joint_names = self.env.cfg.observations.amp.joint_pos.params['asset_cfg'].joint_names
 
         delta_t = self.env.cfg.sim.dt * self.env.cfg.decimation
 
@@ -206,6 +221,8 @@ class AMPOnPolicyRunner:
             amp_data=amp_data,
             amp_normalizer=self.amp_normalizer,
             device=self.device,
+            amp_joint_names=amp_joint_names,
+            joint_order_for_morphosymm=joint_order_for_morphosymm,
             **self.alg_cfg,
         )
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
