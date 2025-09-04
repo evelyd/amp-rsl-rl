@@ -369,7 +369,9 @@ class ExportedActorEMLP(nn.Module):
         else:
             out_tensor = out_geometric
 
-        return out_tensor
+        collapsed_tensor = ms_joints_to_isaaclab(out_tensor, self.joint_order_for_morphosymm, self.amp_joint_names)
+
+        return collapsed_tensor
 
 class ActorEMLP(SimpleEMLP):
     def __init__(self,
