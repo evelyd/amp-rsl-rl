@@ -6,7 +6,7 @@
 
 """Utilities for amp"""
 
-from .utils import Normalizer, RunningMeanStd
+from .utils import Normalizer, RunningMeanStd, fill_replay_buffer
 from .motion_loader import AMPLoader, download_amp_dataset_from_hf
 from .exporter import export_policy_as_onnx
 
@@ -16,4 +16,5 @@ __all__ = [
     "AMPLoader",
     "download_amp_dataset_from_hf",
     "export_policy_as_onnx",
+    "fill_replay_buffer",
 ]

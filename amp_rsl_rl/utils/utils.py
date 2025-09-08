@@ -131,3 +131,99 @@ class Normalizer(RunningMeanStd):
         for expert_batch, policy_batch in zip(expert_generator, policy_generator):
             batch = torch.cat((*expert_batch, *policy_batch), dim=0)
             self.update(batch)
+
+def fill_replay_buffer(algorithm_instance, env_instance, obs_normalizer, critic_obs_normalizer, num_initial_steps=None):
+    """
+    Initializes the replay buffers within the algorithm by performing dummy rollouts,
+    mimicking the regular training loop's data collection process.
+    This version correctly handles rsl_rl's RolloutStorage by performing full rollouts
+    and clearing storage periodically.
+
+    Args:
+        algorithm_instance: PPO or similar
+        env_instance: env
+        state_dim: Dim of a single state observation
+        num_initial_steps: The total number of environment steps to take for pre-filling
+    """
+
+    # Determine num_initial_rollouts based on num_initial_steps
+    if num_initial_steps is None:
+        if hasattr(algorithm_instance, 'replay_buffer') and hasattr(algorithm_instance.replay_buffer.states, 'shape'):
+            required_steps_for_koopman = algorithm_instance.replay_buffer.states.shape[0]
+        else:
+            required_steps_for_koopman = 10000 # Fallback if buffer info not available
+            print("Warning: Could not determine Koopman buffer size. Defaulting to 10000 steps.")
+
+        steps_per_full_rollout = env_instance.num_envs * algorithm_instance.storage.num_transitions_per_env
+        if steps_per_full_rollout == 0: # Avoid division by zero if not configured
+            steps_per_full_rollout = 1 # Dummy value, will lead to few rollouts
+            print("Warning: steps_per_full_rollout is zero, likely due to num_envs or num_steps_per_env. Check config.")
+
+
+        num_initial_rollouts = max(1, (required_steps_for_koopman + steps_per_full_rollout - 1) // steps_per_full_rollout)
+        print(f"No num_initial_steps provided. Will perform {num_initial_rollouts} full rollouts to fill Koopman buffer.")
+    else:
+        # If num_initial_steps is provided, convert it to rollouts
+        steps_per_full_rollout = env_instance.num_envs * algorithm_instance.num_steps_per_env
+        if steps_per_full_rollout == 0:
+            steps_per_full_rollout = 1
+            print("Warning: steps_per_full_rollout is zero, likely due to num_envs or num_steps_per_env. Check config.")
+
+        num_initial_rollouts = max(1, (num_initial_steps + steps_per_full_rollout - 1) // steps_per_full_rollout)
+        print(f"num_initial_steps ({num_initial_steps}) will result in {num_initial_rollouts} full rollouts.")
+
+
+    print(f"Initializing replay buffers by performing {num_initial_rollouts} full rollouts...")
+
+    # Set algorithm's actor_critic to evaluation mode during initialization
+    if hasattr(algorithm_instance.actor_critic, 'eval'):
+        algorithm_instance.actor_critic.eval()
+
+    # Reset environment to get initial observations for the very first rollout
+    obs, extras = env_instance.get_observations()
+    critic_obs = extras["observations"].get("critic", obs)
+    obs, critic_obs = obs.to(algorithm_instance.device), critic_obs.to(algorithm_instance.device)
+
+    # Ensure koopman_transition is initialized and clear if needed
+    if not hasattr(algorithm_instance, 'koopman_transition'):
+        raise AttributeError("Algorithm instance missing 'koopman_transition' attribute.")
+    algorithm_instance.koopman_transition.clear()
+
+    if hasattr(algorithm_instance, 'storage'):
+        algorithm_instance.storage.observations[0].copy_(obs)
+        if hasattr(algorithm_instance.storage, 'critic_observations') and extras["observations"]["critic"] is not None:
+             algorithm_instance.storage.critic_observations[0].copy_(critic_obs)
+    else:
+        print("Warning: Algorithm instance does not have 'storage' attribute. Ensure your PPO handles initial observation internally.")
+
+    for rollout_idx in range(num_initial_rollouts):
+        for i in range(algorithm_instance.storage.num_transitions_per_env):
+            actions = algorithm_instance.act(obs, critic_obs)
+            algorithm_instance.act_koopman(obs, actions)
+            obs, rewards, dones, infos = env_instance.step(actions)
+            _, extras = env_instance.get_observations()
+            obs = obs_normalizer(obs)
+            if "critic" in infos["observations"]:
+                critic_obs = critic_obs_normalizer(
+                    infos["observations"]["critic"]
+                )
+            else:
+                critic_obs = obs
+            obs, critic_obs, rewards, dones = (
+                obs.to(algorithm_instance.device),
+                critic_obs.to(algorithm_instance.device),
+                rewards.to(algorithm_instance.device),
+                dones.to(algorithm_instance.device),
+            )
+            algorithm_instance.process_env_step(rewards, dones, infos)
+
+            algorithm_instance.process_koopman_step(obs)
+
+        algorithm_instance.compute_returns(critic_obs.clone().detach())
+        algorithm_instance.storage.clear()
+
+    print("Replay buffer initialization complete.")
+
+    # Switch back to train mode
+    if hasattr(algorithm_instance.actor_critic, 'train'):
+        algorithm_instance.actor_critic.train()

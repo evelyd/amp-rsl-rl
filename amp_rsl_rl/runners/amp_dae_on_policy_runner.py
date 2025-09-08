@@ -21,10 +21,11 @@ from rsl_rl.utils import store_code_state
 
 from amp_rsl_rl.utils import Normalizer
 from amp_rsl_rl.utils import AMPLoader
-from amp_rsl_rl.algorithms import AMP_PPO, AMP_PPO_DAE
+from amp_rsl_rl.algorithms import AMP_PPO, AMP_PPO_DAE, AMP_PPO_DAE_Online
 from amp_rsl_rl.networks import Discriminator, ActorCriticMoE, ActorCriticMoESymm, ActorCriticSymm
-from amp_rsl_rl.utils import export_policy_as_onnx
+from amp_rsl_rl.utils import export_policy_as_onnx, fill_replay_buffer
 from amp_rsl_rl.runners import AMPOnPolicyRunner
+from amp_rsl_rl.dha_utils import compute_ms_observations_ideal, compute_ms_observations_dae, isaaclab_joints_to_ms
 
 class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
     """
@@ -39,6 +40,9 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.discriminator_cfg = train_cfg["discriminator"]
+        self.task = train_cfg["experiment_name"]
+        if "online" in self.task:
+            self.koopman_cfg = train_cfg["koopman"]
         self.device = device
         self.env = env
         self.video_interval = video_interval
@@ -68,17 +72,23 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
         is_ideal = False
         if num_obs == 90:
+            if "online" in self.task:
+                raise ValueError("The online DAE runner is not yet implemented for the ideal velocity task.")
             ms_critic_obs = num_critic_obs + 3 * ms_joint_difference
             dae_input_size = ms_critic_obs
             is_ideal = True
-        elif num_obs == 357:
+        elif num_obs == 357: # 357 = (3 + 3 + 14 + 14) * 10 + 14 + 2 + 1
             ms_critic_obs = num_critic_obs + (10 * 2 + 1) * ms_joint_difference
             dae_input_size = num_critic_obs - 9 * (3 + 3 + len(amp_joint_names) + len(amp_joint_names)) + 3 * ms_joint_difference
 
-        if alg_class == AMP_PPO_DAE:
+        if alg_class == AMP_PPO_DAE or alg_class == AMP_PPO_DAE_Online:
             is_dae = True
             # Scale the number of critic obs based on the DAE state to latent state ratio, accounting for the difference in joint space
-            obs_state_ratio = self.cfg["obs_state_ratio"]
+            if "online" in self.task:
+                obs_state_ratio = self.koopman_cfg['robot']["obs_state_ratio"]
+            else:
+                obs_state_ratio = self.cfg["obs_state_ratio"]
+
             if actor_critic_class == ActorCriticMoESymm or actor_critic_class == ActorCriticSymm:
                 # if symm and dae, the critic obs is the morphosymm obs + the latent state
                 ac_critic_obs = ms_critic_obs + dae_input_size * obs_state_ratio
@@ -146,8 +156,26 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         for key in list(self.alg_cfg.keys()):
             if key not in alg_class.__init__.__code__.co_varnames:
                 self.alg_cfg.pop(key)
-
-        if alg_class == AMP_PPO_DAE:
+        input(f"Using algorithm: {alg_class.__name__}, Policy: {actor_critic.__class__.__name__}, Task: {self.task}")
+        if alg_class == AMP_PPO_DAE_Online:
+            self.alg: AMP_PPO_DAE_Online = alg_class(
+                koopman_cfg=self.koopman_cfg,
+                task=self.task,
+                dt=delta_t,
+                actor_critic=actor_critic,
+                discriminator=self.discriminator,
+                amp_data=amp_data,
+                amp_normalizer=self.amp_normalizer,
+                device=self.device,
+                G=G,
+                is_ideal=is_ideal,
+                amp_joint_names=amp_joint_names,
+                joint_order_for_morphosymm=joint_order_for_morphosymm,
+                ms_critic_obs=ms_critic_obs,
+                dae_input_size=dae_input_size,
+                **self.alg_cfg,
+            )
+        elif alg_class == AMP_PPO_DAE:
             dae_model_path = self.cfg["model_path"]
             self.alg: AMP_PPO_DAE = alg_class(
                 model_path=dae_model_path,
@@ -196,6 +224,11 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
             [num_critic_obs],
             [self.env.num_actions],
         )
+
+        # Initialize the replay buffer
+        if "online" in self.task:
+            if hasattr(self.alg, 'replay_buffer'):
+                fill_replay_buffer(self.alg, self.env, self.obs_normalizer, self.critic_obs_normalizer)
 
         # Log
         self.log_dir = log_dir
@@ -292,6 +325,10 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         amp_obs = amp_obs.to(self.device)
         self.train_mode()  # switch to train mode (for dropout for example)
 
+        # Set DAE to train mode also
+        if "online" in self.task:
+            self.alg.dae_model.train()
+
         ep_infos = []
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
@@ -314,6 +351,15 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
+
+                    if "online" in self.task:
+                        # Collect data for DAE
+                        if self.alg.is_ideal:
+                            current_states_for_dae = compute_ms_observations_ideal(critic_obs, self.alg.joint_order_for_morphosymm, self.alg.amp_joint_names)
+                        else:
+                            current_states_for_dae = compute_ms_observations_dae(critic_obs, self.alg.joint_order_for_morphosymm, self.alg.amp_joint_names)
+                        current_actions_for_dae = actions.clone()
+
                     self.alg.act_amp(amp_obs)
                     obs, rewards, dones, infos = self.env.step(actions)
                     _, extras = self.env.get_observations()
@@ -347,6 +393,22 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
                     self.alg.process_env_step(rewards, dones, infos)
                     self.alg.process_amp_step(next_amp_obs)
 
+                    if "online" in self.task:
+                        # Get the next states for the DAE
+                        if self.alg.is_ideal:
+                            next_states_for_dae = compute_ms_observations_ideal(critic_obs, self.alg.joint_order_for_morphosymm, self.alg.amp_joint_names)
+                        else:
+                            next_states_for_dae = compute_ms_observations_dae(critic_obs, self.alg.joint_order_for_morphosymm, self.alg.amp_joint_names)
+
+                        current_actions_for_dae = isaaclab_joints_to_ms(current_actions_for_dae, self.alg.joint_order_for_morphosymm, self.alg.amp_joint_names)
+
+                        # Fill the PER buffer
+                        self.alg.replay_buffer.insert(
+                            current_states_for_dae.cpu(),
+                            current_actions_for_dae.cpu(),
+                            next_states_for_dae.cpu()
+                        )
+
                     # The next observation becomes the current observation for the next step
                     amp_obs = torch.clone(next_amp_obs)
 
@@ -377,6 +439,134 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
+            if "online" in self.task:
+                # Perform DAE training step
+                mean_dae_loss = 0.0
+                dae_train_time = 0.0
+                mean_dae_obs_pred_loss = 0.0
+                mean_dae_state_rec_loss = 0.0
+                mean_dae_state_pred_loss = 0.0
+
+                if len(self.alg.replay_buffer) >= self.koopman_cfg["model"]["mini_batch_size"]:
+                    dae_training_start_time = time.time()
+
+                    dae_num_mini_batches = self.koopman_cfg["model"]["num_mini_batches"]
+                    dae_mini_batch_size = self.koopman_cfg["model"]["mini_batch_size"]
+
+                    dae_losses_this_iter = []
+                    dae_obs_pred_losses_this_iter = []
+                    dae_state_rec_losses_this_iter = []
+                    dae_state_pred_losses_this_iter = []
+
+                    # Anneal beta for Importance Sampling weights
+                    current_beta = self.alg.replay_buffer.beta_initial + (1.0 - self.alg.replay_buffer.beta_initial) * \
+                                min(1.0, (it - self.current_learning_iteration) / self.alg.replay_buffer.beta_annealing_steps)
+
+
+                    # Iterating over mini-batches for DAE training
+                    for _ in range(dae_num_mini_batches):
+                        # Sample from the Prioritized Replay Buffer
+                        batch_states_raw, batch_actions_raw, batch_next_states_raw, batch_tree_indices, is_weights = \
+                            self.alg.replay_buffer.sample(dae_mini_batch_size, current_beta)
+
+                        # Transfer is_weights to cuda device
+                        is_weights = is_weights.to(self.device)
+
+                        sample_generator = self.alg.replay_buffer.preprocess_samples(
+                            batch_states_raw, batch_actions_raw, batch_next_states_raw,
+                            frames_per_step=self.koopman_cfg["robot"]["frames_per_state"],
+                            prediction_horizon=self.koopman_cfg["robot"]["pred_horizon"]
+                        )
+
+                        all_state_observations = []
+                        all_action_observations = []
+                        all_next_state_observations = []
+                        for sample in sample_generator:
+                            all_state_observations.append(sample["state_observations"].unsqueeze(0))
+                            all_action_observations.append(sample["action_observations"].unsqueeze(0))
+                            all_next_state_observations.append(sample["next_state_observations"].unsqueeze(0))
+
+                        # If preprocess_samples yielded no valid samples (e.g., traj too short), skip this mini-batch
+                        if not all_state_observations:
+                            print("Warning: No valid samples generated by preprocess_samples, skipping DAE mini-batch.")
+                            continue
+
+                        combined_state_observations = torch.cat(all_state_observations, dim=0).to(self.device)
+                        combined_action_observations = torch.cat(all_action_observations, dim=0).to(self.device)
+                        combined_next_state_observations = torch.cat(all_next_state_observations, dim=0).to(self.device)
+
+                        # Normalize the observations and actions
+                        normed_states, normed_actions = self.alg.obs_action_normalizer.normalize(
+                            combined_state_observations, combined_action_observations
+                        )
+                        next_normed_states = self.alg.obs_action_normalizer.normalize(
+                            combined_next_state_observations
+                        )
+
+                        # Move preprocessed and normalized batch to the correct device for the DAE model
+                        batch = self.alg.replay_buffer.shape_states_actions(
+                                normed_states, normed_actions, next_normed_states
+                        )
+
+                        batch_on_device = {k: v.to(self.device) for k, v in batch.items()}
+
+                        # Forward pass through DAE
+                        if hasattr(self.alg.dae_model, 'action_dim') and self.alg.dae_model.action_dim > 0:
+                            outputs = self.alg.dae_model(**batch_on_device)
+                        else:
+                            outputs = self.alg.dae_model(**batch_on_device)
+
+                        # Compute DAE losses
+                        dae_loss_per_sample, dae_metrics = self.alg.dae_model.compute_loss_and_metrics(**outputs, **batch_on_device)
+
+                        # Apply importance sampling weights to the loss
+                        actual_batch_size_for_loss = dae_loss_per_sample.shape[0]
+                        if is_weights.shape[0] != actual_batch_size_for_loss:
+                            is_weights_aligned = is_weights[:actual_batch_size_for_loss]
+                        else:
+                            is_weights_aligned = is_weights
+
+                        weighted_dae_loss = (dae_loss_per_sample * is_weights_aligned).mean()
+
+                        # Backpropagate and update DAE weights
+                        self.alg.dae_optimizer.zero_grad()
+                        weighted_dae_loss.backward()
+                        self.alg.dae_optimizer.step()
+
+                        # Update priorities in the replay buffer
+                        # Use the per-sample losses as errors
+                        dae_errors_for_priority_update = dae_loss_per_sample.detach().cpu().numpy()
+
+                        # Ensure that the batch_tree_indices also aligns with the number of samples that actually generated a loss.
+                        if len(batch_tree_indices) != actual_batch_size_for_loss:
+                            batch_tree_indices_aligned = batch_tree_indices[:actual_batch_size_for_loss]
+                        else:
+                            batch_tree_indices_aligned = batch_tree_indices
+
+                        # Prioritize samples based on the overall DAE loss
+                        self.alg.replay_buffer.update_priorities(
+                            batch_tree_indices_aligned,
+                            dae_errors_for_priority_update
+                        )
+
+                        dae_losses_this_iter.append(weighted_dae_loss.item())
+                        dae_obs_pred_losses_this_iter.append(dae_metrics["obs_pred_loss"].item())
+                        dae_state_rec_losses_this_iter.append(dae_metrics["state_rec_loss"].item())
+                        dae_state_pred_losses_this_iter.append(dae_metrics["state_pred_loss"].item())
+
+                    if dae_losses_this_iter:
+                        mean_dae_loss = sum(dae_losses_this_iter) / len(dae_losses_this_iter)
+                        mean_dae_obs_pred_loss = sum(dae_obs_pred_losses_this_iter) / len(dae_obs_pred_losses_this_iter)
+                        mean_dae_state_rec_loss = sum(dae_state_rec_losses_this_iter) / len(dae_state_rec_losses_this_iter)
+                        mean_dae_state_pred_loss = sum(dae_state_pred_losses_this_iter) / len(dae_state_pred_losses_this_iter)
+                    else:
+                        mean_dae_loss = 0.0 # No batches trained
+                        mean_dae_obs_pred_loss = 0.0
+                        mean_dae_state_rec_loss = 0.0
+                        mean_dae_state_pred_loss = 0.0
+
+                    dae_train_time = time.time() - dae_training_start_time
+
             mean_style_reward_log /= self.num_steps_per_env
             mean_task_reward_log /= self.num_steps_per_env
             mean_total_reward_log = mean_style_reward_log + mean_task_reward_log
@@ -396,9 +586,18 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
             learn_time = stop - start
             self.current_learning_iteration = it
             if self.log_dir is not None:
-                self.log(locals())
-            if it % self.save_interval == 0:\
+                locs = locals()
+                if "online" in self.task:
+                    locs["mean_dae_loss"] = mean_dae_loss
+                    locs["mean_dae_obs_pred_loss"] = mean_dae_obs_pred_loss
+                    locs["mean_dae_state_rec_loss"] = mean_dae_state_rec_loss
+                    locs["mean_dae_state_pred_loss"] = mean_dae_state_pred_loss
+                    locs["dae_train_time"] = dae_train_time
+                self.log(locs)
+            if it % self.save_interval == 0:
                 self.save(os.path.join(self.log_dir, f"model_{it}.pt"), save_onnx=True)
+                if "online" in self.task:
+                    torch.save(self.alg.dae_model.state_dict(), os.path.join(self.log_dir, 'dae_model_{}.pt'.format(it)))
             ep_infos.clear()
             if it == start_iter:
                 # obtain all the diff files
@@ -496,6 +695,14 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
             "Perf/collection time", locs["collection_time"], locs["it"]
         )
         self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+
+        if "online" in self.task:
+                self.writer.add_scalar("DAE/loss", locs["mean_dae_loss"], locs["it"]) # or self.current_learning_iteration
+                self.writer.add_scalar("DAE/obs_pred_loss", locs["mean_dae_obs_pred_loss"], locs["it"])
+                self.writer.add_scalar("DAE/state_rec_loss", locs["mean_dae_state_rec_loss"], locs["it"])
+                self.writer.add_scalar("DAE/state_pred_loss", locs["mean_dae_state_pred_loss"], locs["it"])
+                self.writer.add_scalar("DAE/train_time", locs["dae_train_time"], locs["it"])
+
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar(
                 "Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"]

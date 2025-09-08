@@ -18,6 +18,7 @@ from hydra import initialize, compose
 import escnn
 from escnn.nn import FieldType
 from morpho_symm.utils.rep_theory_utils import group_rep_from_gens
+import math
 
 def isaaclab_joints_to_ms(joints, joint_order_for_morphosymm, amp_joint_names=None):
     """
@@ -319,3 +320,132 @@ def get_trained_dae_model(model_dir, G, is_ideal: bool = False):
 
     return model
 
+def initialize_dae_model(cfg, G, task: str, dt: int, device: torch.device, is_ideal: bool = False) -> torch.nn.Module:
+    """
+    Initializes a Koopman model based on the provided configuration (from train_cfg.koopman_model).
+    Can also load pre-trained weights if cfg.load_path is specified.
+
+    Args:
+        cfg: The Koopman model configuration object from train_cfg.
+        state_dim (int): The dimension of the observation space (from environment).
+        action_dim (int): The dimension of the action space (from environment).
+        dt (float): The environment's delta time (from environment).
+        device (torch.device): The torch device (e.g., 'cuda:0', 'cpu').
+
+    Returns:
+        torch.nn.Module: An initialized Koopman model (new or loaded).
+    """
+
+    # Create the state representations
+    gspace = escnn.gspaces.no_base_space(G)
+    # Extract the representations from G.representations.items()
+    rep_Rd = G.representations['R3']
+    rep_TqQ_js = G.representations['TqQ_js']
+    rep_xy = group_rep_from_gens(G, rep_H={h: rep_Rd(h)[:2, :2].reshape((2, 2)) for h in G.elements if h != G.identity})
+    rep_xy.name = "base_xy"
+    rep_euler_xyz = G.representations['euler_xyz']
+    rep_euler_z = group_rep_from_gens(G, rep_H={h: rep_euler_xyz(h)[2, 2].reshape((1, 1)) for h in G.elements if h != G.identity})
+    rep_euler_z.name = "euler_z"
+
+    # Create dict to define which obs match which representations
+    obs_rep_dict = {
+        'base_vel': rep_Rd,
+        'base_ang_vel': rep_euler_xyz,
+        'projected_gravity': rep_Rd,
+        'joint_pos': rep_TqQ_js,
+        'joint_vel': rep_TqQ_js,
+        'prev_action': rep_TqQ_js,
+        'velocity_commands_xy': rep_xy,
+        'velocity_commands_z': rep_euler_z,
+        'action': rep_TqQ_js,
+    }
+
+    state_reps = []
+    action_reps = []
+    for state_obs in cfg["robot"]["state_obs"]:
+        if state_obs in obs_rep_dict:
+            state_reps.append(obs_rep_dict[state_obs])
+        else:
+            raise ValueError(f"Observation '{state_obs}' not found in the defined representations.")
+    for action_obs in cfg["robot"]["action_obs"]:
+        if action_obs in obs_rep_dict:
+            action_reps.append(obs_rep_dict[action_obs])
+        else:
+            raise ValueError(f"Action '{action_obs}' not found in the defined representations.")
+
+    state_type = FieldType(gspace, representations=state_reps)
+    action_type = FieldType(gspace, representations=action_reps)
+
+    state_dim = cfg["robot"]["state_dim"]
+    action_dim = cfg["robot"]["action_dim"]
+
+    # Ensure that with duplicate reps the size matches the expected dimensions
+    state_type.size = state_dim
+    action_type.size = action_dim
+
+    obs_state_dim = math.ceil(cfg["robot"]["obs_state_ratio"] * state_dim)
+    num_hidden_neurons = cfg["model"]["num_hidden_units"]
+    if obs_state_dim > num_hidden_neurons:
+        num_hidden_neurons = 2 ** math.ceil(math.log2(obs_state_dim))
+
+    activation = cfg["model"]["activation"]
+
+    if not cfg["model"]["equivariant"]:
+        activation = class_from_name("torch.nn", activation)
+
+    obs_fn_params = {'num_layers': cfg["model"]["num_layers"], 'num_hidden_units': cfg["model"]["num_hidden_units"], 'activation': activation, 'bias': cfg["model"]["bias"], 'batch_norm': cfg["model"]["batch_norm"]}
+
+    initial_rng_state = torch.get_rng_state()
+
+    if "edae" in task:
+        model = EquivDAE(
+            state_rep=state_type.representation,
+            obs_state_dim=obs_state_dim,
+            dt=dt,
+            orth_w=cfg["model"]["orth_w"],
+            obs_fn_params=obs_fn_params,
+            group_avg_trick=cfg["model"]["group_avg_trick"],
+            state_dependent_obs_dyn=cfg["model"]["state_dependent_obs_dyn"],
+            enforce_constant_fn=cfg["model"]["constant_function"],
+        )
+    elif "ecdae" in task:
+        model = ControlledEquivDAE(
+            state_rep=state_type.representation,
+            action_rep=action_type.representation,
+            obs_state_dim=obs_state_dim,
+            dt=dt,
+            orth_w=cfg["model"]["orth_w"],
+            obs_fn_params=obs_fn_params,
+            group_avg_trick=cfg["model"]["group_avg_trick"],
+            state_dependent_obs_dyn=cfg["model"]["state_dependent_obs_dyn"],
+            enforce_constant_fn=cfg["model"]["constant_function"],
+        )
+    elif "cdae" in task:
+        model = ControlledDAE(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            obs_state_dim=obs_state_dim,
+            dt=dt,
+            orth_w=cfg["model"]["orth_w"],
+            obs_fn_params=obs_fn_params,
+            enforce_constant_fn=cfg["model"]["constant_function"],
+        )
+    elif "dae" in task:
+        model = DAE(
+            state_dim=state_dim,
+            obs_state_dim=obs_state_dim,
+            dt=dt,
+            obs_pred_w=cfg["model"]["obs_pred_w"],
+            orth_w=cfg["model"]["orth_w"],
+            obs_fn_params=obs_fn_params,
+            enforce_constant_fn=cfg["model"]["constant_function"],
+        )
+    else:
+        raise ValueError(f"Trying to create DAE model with unsupported task: {task}")
+
+    torch.set_rng_state(initial_rng_state)
+
+    # Put the model on the specified device
+    model.to(device)
+
+    return model
