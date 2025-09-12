@@ -72,8 +72,8 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
         ms_joint_difference = len(joint_order_for_morphosymm) - len(amp_joint_names)
         is_ideal = False
         if num_obs == 90:
-            if "online" in self.task:
-                raise ValueError("The online DAE runner is not yet implemented for the ideal velocity task.")
+            # if "online" in self.task:
+            #     raise ValueError("The online DAE runner is not yet implemented for the ideal velocity task.")
             ms_critic_obs = num_critic_obs + 3 * ms_joint_difference
             dae_input_size = ms_critic_obs
             is_ideal = True
@@ -99,6 +99,8 @@ class AMPDAEOnPolicyRunner(AMPOnPolicyRunner):
             obs_state_ratio = 1
             ac_critic_obs = ms_critic_obs
             is_dae = False
+
+        # input(f"obs_state_ratio: {obs_state_ratio}, num_obs: {num_obs}, num_critic_obs: {num_critic_obs}, ms_critic_obs: {ms_critic_obs}, ac_critic_obs: {ac_critic_obs}, dae_input_size: {dae_input_size}, is_dae: {is_dae}, is_ideal: {is_ideal}")
 
         if actor_critic_class == ActorCriticMoESymm or actor_critic_class == ActorCriticSymm:
             actor_critic: ActorCriticMoESymm | ActorCriticSymm = (

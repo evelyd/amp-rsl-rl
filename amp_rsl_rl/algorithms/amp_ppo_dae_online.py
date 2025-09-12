@@ -153,7 +153,10 @@ class AMP_PPO_DAE_Online(AMP_PPO):
             latent = self.dae_model.obs_fn(dae_input_normed).detach()
 
         if "Symm" in type(self.actor_critic).__name__:
-            return torch.cat((compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
+            if self.is_ideal:
+                return torch.cat((compute_ms_observations_ideal(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
+            else:
+                return torch.cat((compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
         else:
             return torch.cat((critic_obs, latent), dim=-1)
 

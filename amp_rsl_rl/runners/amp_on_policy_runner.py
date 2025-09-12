@@ -223,6 +223,7 @@ class AMPOnPolicyRunner:
             device=self.device,
             amp_joint_names=amp_joint_names,
             joint_order_for_morphosymm=joint_order_for_morphosymm,
+            is_ideal=is_ideal,
             **self.alg_cfg,
         )
         self.num_steps_per_env = self.cfg["num_steps_per_env"]

@@ -349,7 +349,7 @@ def initialize_dae_model(cfg, G, task: str, dt: int, device: torch.device, is_id
 
     # Create dict to define which obs match which representations
     obs_rep_dict = {
-        'base_vel': rep_Rd,
+        'base_lin_vel': rep_Rd,
         'base_ang_vel': rep_euler_xyz,
         'projected_gravity': rep_Rd,
         'joint_pos': rep_TqQ_js,
