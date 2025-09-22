@@ -103,8 +103,6 @@ class AMP_PPO_DAE(AMP_PPO):
         if self.is_ideal:
             dae_input = compute_ms_observations_ideal(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)
         else:
-            #TODO for the input to the DAE, I should only use the most recent ts of measurements, not the whole history, and rn it's using the whole history
-            # i guess for the actor it's fine this way but for the dae it needs to change
             dae_input = compute_ms_observations_dae(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names)
         dae_input_normed = safe_standardize(dae_input, self.state_mean, self.state_std)
 
@@ -116,7 +114,10 @@ class AMP_PPO_DAE(AMP_PPO):
             latent = self.dae_model.obs_fn(dae_input_normed).detach()
 
         if "Symm" in type(self.actor_critic).__name__:
-            return torch.cat((compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
+            if self.is_ideal:
+                return torch.cat((compute_ms_observations_ideal(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
+            else:
+                return torch.cat((compute_ms_observations(critic_obs, self.joint_order_for_morphosymm, self.amp_joint_names), latent), dim=-1)
         else:
             return torch.cat((critic_obs, latent), dim=-1)
 

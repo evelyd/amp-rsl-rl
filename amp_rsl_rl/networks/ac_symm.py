@@ -237,8 +237,11 @@ class ActorCriticSymm(nn.Module):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
     def act_inference(self, observations):
+        observations = compute_ms_observations_ideal(
+            observations, self.joint_order_for_morphosymm, self.amp_joint_names)
         observations = self.in_field_type(observations)
         actions_mean = self.actor(observations).tensor
+        actions_mean = ms_joints_to_isaaclab(actions_mean, self.joint_order_for_morphosymm, self.amp_joint_names)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
